@@ -1,14 +1,14 @@
 # Production WSGI config: 1 worker process, 1 shared KittenTTS model,
-# 2 simultaneous generation slots (see app.py BoundedSemaphore).
+# 4 simultaneous generation slots (see app.py BoundedSemaphore).
 #
 # workers=1 is deliberate: each gunicorn worker imports app.py and loads its
 # OWN model copy (~78 MB weights + runtime). Two workers = two model copies
 # (~2x RAM) with no correctness benefit here, since the espeak race is
 # already handled in-process. One worker + gthread threads + semaphore gives
-# 2 inference slots on 1 model copy.
+# 4 inference slots on 1 model copy.
 workers = 1
 worker_class = "gthread"
-threads = 4  # 2 gen slots + headroom so /health + /api/voices stay responsive
+threads = 6  # 4 gen slots + headroom so /health + /api/voices stay responsive
 bind = "0.0.0.0:5000"
 
 # Hang protection: semaphore wait is 120 s (GEN_QUEUE_TIMEOUT); kill a worker
