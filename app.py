@@ -54,7 +54,7 @@ from flask import Flask, Response, jsonify, request
 
 import onnxruntime as ort
 from kittentts import KittenTTS
-from kittentts.onnx_model import chunk_text
+from kittentts.onnx_model import basic_english_tokenize, chunk_text, ensure_punctuation
 
 # FP32 nano is the speed default. The official int8 repo
 # (KittenML/kitten-tts-nano-0.8-int8, 24MB vs 54MB) benchmarked ~4-7x
@@ -63,6 +63,13 @@ from kittentts.onnx_model import chunk_text
 # Keep it opt-in via KITTEN_MODEL for memory-constrained edge deploys only.
 MODEL_NAME = os.environ.get("KITTEN_MODEL", "KittenML/kitten-tts-nano-0.8")
 SAMPLE_RATE = 24000
+# BERT front-end of the nano ONNX graph aborts with
+# "/bert/Expand: invalid expand shape" once the phonemized token sequence
+# (NOT characters) exceeds its positional table (~512, empirically 494 OK /
+# 564 FAIL). chunk_text() splits by characters (400), and espeak verbalizes
+# digits/dates ~10x (110 digit chars -> 1154 tokens), so a single 400-char
+# chunk can overflow. Keep a safety margin below 512.
+MAX_PHONEME_TOKENS = max(64, int(os.environ.get("TOKEN_SAFE_LIMIT", "500")))
 DEFAULT_VOICE = "Bella"
 DEFAULT_SPEED = 1.0
 MIN_SPEED = 0.5
@@ -134,6 +141,61 @@ def _locked_phonemize(*args, **kwargs):
 model.model.phonemizer.phonemize = _locked_phonemize
 
 
+def _measure_phoneme_tokens(text: str) -> int:
+    """Token count the ONNX session will actually see for `text`.
+
+    Mirrors KittenTTS_1_Onnx._prepare_inputs tokenization
+    (phonemize -> basic_english_tokenize -> TextCleaner -> +3 framing
+    tokens) without running inference. Uses the locked phonemizer, so it
+    is safe to call from any thread.
+    """
+    inner = model.model  # KittenTTS_1_Onnx
+    phonemes_list = inner.phonemizer.phonemize([text])
+    phonemes = " ".join(basic_english_tokenize(phonemes_list[0]))
+    return len(inner.text_cleaner(phonemes)) + 3
+
+
+def _split_oversize_chunk(text: str, depth: int = 0) -> list:
+    """Recursively split one chunk_text() piece until each part fits.
+
+    Word-list bisection first (preserves word integrity and prosody);
+    character bisection fallback for single unbreakable words (digit runs
+    like "9999..."). Each part is re-punctuated like upstream chunk_text.
+    Raises ValueError if nothing speakable remains.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if depth > 12 or len(text) <= 1:
+        raise ValueError(
+            f"Text chunk still exceeds model token limit ({MAX_PHONEME_TOKENS}) "
+            "and cannot be split further. Simplify numbers or long words."
+        )
+    try:
+        n = _measure_phoneme_tokens(text)
+    except Exception:
+        # Phonemizer failure -> let synthesis surface it; don't loop.
+        return [text]
+    if n <= MAX_PHONEME_TOKENS:
+        return [text]
+    words = text.split()
+    if len(words) >= 2:
+        mid = len(words) // 2
+        left = _split_oversize_chunk(" ".join(words[:mid]), depth + 1)
+        right = _split_oversize_chunk(" ".join(words[mid:]), depth + 1)
+        return left + right
+    # Single word overflow (typically a digit run): bisect characters.
+    mid = len(text) // 2
+    left = _split_oversize_chunk(text[:mid], depth + 1)
+    right = _split_oversize_chunk(text[mid:], depth + 1)
+    return left + right
+
+
+def _is_token_overflow(exc: BaseException) -> bool:
+    msg = f"{type(exc).__name__}: {exc}"
+    return "Expand" in msg and "expand shape" in msg.lower()
+
+
 def generate_parallel(text: str, voice: str, speed: float):
     """Synthesize long text with chunk-level parallelism.
 
@@ -143,19 +205,36 @@ def generate_parallel(text: str, voice: str, speed: float):
     Note: sample-level bit-equality across runs is not guaranteed even
     sequentially (multithreaded ORT kernels are nondeterministic); parallel
     output differs only within that same run-to-run variance.
+
+    Token guard: each chunk_text() piece is pre-measured in phoneme tokens
+    and recursively split so the BERT Expand node (~512 positional cap)
+    never sees an overflow shape. Without this, digit/date-heavy chunks
+    abort the whole request with 500 "invalid expand shape".
     """
     inner = model.model  # KittenTTS_1_Onnx
     chunks = chunk_text(text)
     if not chunks:
         raise ValueError("No text chunks to synthesize.")
-    if len(chunks) == 1 or CHUNK_WORKERS == 1:
-        return inner.generate_single_chunk(chunks[0], voice, speed)
-    workers = max(1, min(CHUNK_WORKERS, len(chunks)))
+    safe: list = []
+    for c in chunks:
+        safe.extend(_split_oversize_chunk(c))
+    safe = [ensure_punctuation(s) for s in safe if (s or "").strip()]
+    if not safe:
+        raise ValueError("No text chunks to synthesize.")
+    if len(safe) != len(chunks):
+        print(
+            f"[tts] token-split {len(chunks)} -> {len(safe)} chunks "
+            f"(limit={MAX_PHONEME_TOKENS})",
+            flush=True,
+        )
+    if len(safe) == 1 or CHUNK_WORKERS == 1:
+        return inner.generate_single_chunk(safe[0], voice, speed)
+    workers = max(1, min(CHUNK_WORKERS, len(safe)))
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="kitten-chunk"
     ) as ex:
         audios = list(
-            ex.map(lambda c: inner.generate_single_chunk(c, voice, speed), chunks)
+            ex.map(lambda c: inner.generate_single_chunk(c, voice, speed), safe)
         )
     return np.concatenate(audios, axis=-1)
 
@@ -225,9 +304,26 @@ def tts():
         try:
             audio = generate_parallel(text, voice=voice, speed=speed)
         except ValueError as e:
-            # e.g. unknown voice from onnx_model._prepare_inputs
+            # e.g. unknown voice from onnx_model._prepare_inputs, empty input,
+            # or an unsplittable over-limit chunk.
             return jsonify({"error": str(e)}), 400
-        except Exception as e:  # noqa: BLE001 - surface as 500 JSON
+        except Exception as e:  # noqa: BLE001 - surface as JSON
+            if _is_token_overflow(e):
+                # Residual BERT positional-cap overflow (should be rare after
+                # the token guard; means input is pathologically dense).
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                "Input too complex for the model in one chunk "
+                                f"(BERT token limit ~{MAX_PHONEME_TOKENS}). "
+                                "Simplify numbers/long words or split the request. "
+                                f"Detail: {e}"
+                            )
+                        }
+                    ),
+                    400,
+                )
             return jsonify({"error": f"Synthesis failed: {e}"}), 500
 
         if audio is None or len(audio) == 0:
